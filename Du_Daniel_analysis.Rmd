@@ -1,0 +1,802 @@
+---
+title: "Final Project: Classification of Music Genres"
+output: html_notebook
+---
+
+## Introduction
+This notebook aims to classify music genre of a song, given metrics of its musical construction and popularity. 
+
+The model used is XGBoost because of its performance. XGBoost is a decision tree ensemble method that learns round after round. XGBoost has many hyper parameters, which can be used to prevent over fitting common with decision trees. It will be trained with basic hyper parameters before a final model is constructed through hyper parameter tuning  with cross validation. The model will be evaluated with accuracy and F1 Score.
+
+
+
+## Loading packages
+
+```{r}
+# Used for setting working directory
+library(here)
+#Used for data manipulations
+library(dplyr)
+library(tidyr)
+library(missMDA)
+# used for plotting
+library(ggplot2)
+library(corrplot)
+library(ggfortify)
+library(caret)
+library(patchwork)
+# Used for training model
+library(xgboost)
+library(MLmetrics)
+```
+
+
+## About the data
+Link: https://www.kaggle.com/datasets/vicsuperman/prediction-of-music-genre
+
+This kaggle data set on music contains 50005 observations and 18 variables.
+
+The response variable is music genres: 'Electronic', 'Anime', 'Jazz', 'Alternative', 'Country', 'Rap', 'Blues', 'Rock', 'Classical', and 'Hip-Hop.'
+
+The predictor variables include popularity, acousticness(confidence on whether a track is acoustic), danceability(how suitable a track is for dancing), duration in miliseconds, energy(confidence of intensity/activity), instrumentalness(whether a track contains only instruments), key, liveness(prescence of audience), loudness(overall loudness in dB, can be negative), mode(major or minor), speechiness(presence of spoken words), tempo in BPM, and valence(measure of positive sentiment).
+
+These variables originate from Spotify's API audio features (https://developer.spotify.com/documentation/web-api/reference/get-audio-features).
+
+ID, artist name, track name, obtained date are theoretically independent of music genre, so they will be removed. 
+
+
+The summary reveals missing values and erroneous data.
+
+```{r}
+# setting seed
+set.seed(1)
+#creating flag variable
+outliers_removed <- FALSE
+#loading data set
+setwd(here())
+music.df <- read.csv("music_genre.csv", na.strings = c("NA","?",""))
+# viewing structure of the data set
+str(music.df)
+summary(music.df)
+```
+
+
+
+
+## Initial cleaning
+
+There are duplicated, blank observations and  observations that have duplicated track name and artist name. The filter command will deal with both. 
+
+The summary of duration_ms shows minimum values of -1. This cannot be the case, as time cannot be negative. Double checking with the documentation(https://developer.spotify.com/documentation/web-api/reference/get-audio-features), negative duration_ms are extraneous. They will be marked as NA and imputed later on. 
+
+Popularity will be divided by 100 so it follows the 0-1 format for similar features.
+
+The variables irrelevant to music genre will be removed. 
+```{r}
+#duplicate and blank observations
+head(music.df[duplicated(music.df),])
+#observations with same track name and artist name, indicating duplicated observation
+head(music.df[duplicated(music.df[c("track_name", "artist_name")]),])
+nrow(music.df[duplicated(music.df[c("track_name", "artist_name")]),])
+music.df<- music.df %>%distinct(track_name, artist_name, .keep_all = TRUE)
+
+# marking extraneous inputs for duration as NA
+music.df <- music.df %>%mutate(duration_ms = ifelse(duration_ms < 0, NA, duration_ms))
+# dividing popularity by 100
+if (max(music.df$popularity, na.rm = TRUE)>1){
+music.df <- music.df %>%mutate(popularity = popularity/100)
+}
+# removing irrelevant variables
+music.df <- select(music.df, -c(instance_id,artist_name,track_name,obtained_date ))
+
+
+```
+
+## Initial plotting of the variables
+Bar graphs will be used to graph categorical variables, and Histograms and Boxplots will be used to graph numerical variables. 
+The categorical plot of the label, Music Genre, shows relative balance among the classes, except for Hip Hop and Classical. 
+The numerical plots show significant outliers, such as in duration. For instance, an outlier in duration has a duration of 4830606 ms, or 1 hour and 30 minutes.
+
+```{r}
+# exploring distribution of categorical variables
+catagorical_var <- c("key","mode","music_genre")
+catagorical_lab <- c("Musical Pitch","Modality(major or minor)","Music Genre")
+index <- 1
+plot_df <- drop_na(music.df)
+for (i in catagorical_var) {
+  catagorical_plot <- ggplot(plot_df, aes(x = plot_df[, i])) +
+    geom_bar(fill = "#AFCBD5")+
+    ggtitle(paste("Distribution of ", i),)+
+    xlab(catagorical_lab[index])
+  print(catagorical_plot)
+  index <- index +1
+}
+
+#exploring distribution of numerical variables
+numerical_var <- c("popularity","acousticness","danceability","duration_ms","energy", "instrumentalness","liveness","loudness","speechiness","tempo","valence")
+numerical_lab <- c("Popularity(scale from 0-1)","Acousticness(scale from 0-1)","Danceability(scale from 0-1)","Duration(ms)","Energy(scale from 0-1)", "Instrumentalness(scale from 0-1)","Prescence of Live Audience (scale from 0-1)","Loudness(amount of dB normalization)","speechiness(scale from 0-1)","Tempo(BPM)","Positive Sentiment(scale from 0-1)")
+index <- 1
+for (i in numerical_var) {
+  hist(
+   plot_df[,i],
+   main = paste("Historgram of ", i),
+   col = "#815355",
+   xlab = numerical_lab[index])
+  boxplot(
+    plot_df[,i],
+    main = paste("Boxplot of ", i),
+    col = "#815355",
+    ylab = numerical_lab[index])
+  index <- index +1
+}
+
+```
+
+## Removing outliers
+
+Outliers will be removed based on standard deviation. In this case, an outlier is 3 standard deviations away from the mean. Assuming normal distribution, 99.7% of observations will not be considered an outlier. Also, obersvations with numerical NAs will be kept for imputation. However, because of the  of the data and the fact that the loop will consider all variables, a considerable amount of observations will be removed.
+```{r}
+# removing outliers based on standard deviation
+if(outliers_removed == FALSE){
+  for(i in numerical_var){
+   mean_col <- mean(music.df[[i]], na.rm = TRUE)
+   sd_col <- sd(music.df[[i]], na.rm = TRUE)
+   low_col <- mean_col-3*sd_col
+   high_col <- mean_col+3*sd_col
+   music.df <- music.df %>% filter((music.df[[i]] >= low_col & music.df[[i]] <= high_col) | is.na(music.df[[i]]))
+  }
+  outliers_removed <- TRUE
+}
+# replotting numerial variables after outliers are removed
+plot_df <- drop_na(music.df)
+index <- 1
+for (i in numerical_var) {
+  hist(
+   plot_df[,i],
+   main = paste("Historgram of ", i),
+   col = "#815355",
+   xlab = numerical_lab[index])
+  boxplot(
+    plot_df[,i],
+    main = paste("Boxplot of ", i),
+    col = "#815355",
+    ylab = numerical_lab[index])
+  index <- index +1
+}
+```
+
+
+## Creating training test split
+
+The training test split is created now, before NA numerical values are imputed with Principal Component Analysis.
+ Principal Component Analysis may introduce data leakage if the split is done afterwards, resulting in misleading model evaluation. Because of the split, data preprocessing must be done in parallel.
+
+```{r}
+# Creating Training Test Split
+test_ind <- sample(seq_len(nrow(music.df)), size = 0.3 * nrow(music.df),)
+train.df <- music.df[-test_ind,]
+test.df <- music.df[test_ind,]
+
+```
+
+
+## Data imputation
+
+Principal Component Analysis will fill in missing variables, aiming to preserve variance and correlation.
+
+The number of dimensions will be estimated with cross validation, which will be used by PCA to impute. 
+
+```{r}
+# simply Removing NA values for test set
+test.df <- drop_na(test.df)
+#diving categorical and numerical columns for imputation on numerical columns
+numeric_columns <-select(train.df, numerical_var)
+categorical_columns <- select(train.df, catagorical_var)
+#imputing NA numerical values
+ncp <- estim_ncpPCA(numeric_columns, method.cv = "Kfold")
+pca_impute <-  imputePCA(numeric_columns, ncp = ncp$ncp)
+numeric_columns <- pca_impute$completeObs
+
+combined_df <- bind_cols(numeric_columns, categorical_columns)
+#arranging the dataset so it follows original order
+train.df <- combined_df[,colnames(train.df)]
+
+# Double checking if all NAs are dealt with
+summary(train.df)
+sum(is.na.data.frame(train.df)) + sum(is.na.data.frame(test.df)) == 0
+```
+
+## Feature encoding
+
+Because the model used is XGBoost, the catagorical variables key, mode, and genre must be encoded to be numeric. The key is encoded to follow the order of musical notes. The major is encoded as a binary variable. The music_genre is encoded and then each value is subtracted by 1. This is because for the label to be usable by XGBoost, it needs to be converted so that it starts from 0 to length-1.
+
+```{r}
+#creating function for encoding to ensure encoding is done in parallel with train.df and test.df
+unencoded_music_genre <- levels(as.factor(music.df$music_genre))
+encoder <- function(df) {
+ # encoding key following music notes
+  if (is.numeric(df$key) == FALSE) {
+    df$key <- as.numeric(factor(df$key, levels = c("A", "A#", "B", "B#", "C", "C#","D","D#","E","E#","F","F#","G", "G#")))
+  }
+  # encoding mode
+  if (is.numeric(df$mode) == FALSE) {
+    df$mode <- ifelse(df$mode == "Major", 1, 0)
+  }
+  # encoding music genre
+  df$music_genre <- as.numeric(factor(df$music_genre))
+  # A special requirement of XGBoost is that the label must start from 0 to length(unique(dataframe$music_genre))-1
+  if (min(df$music_genre) != 0) {
+    df <- df %>% mutate(music_genre = music_genre - 1)
+  }
+}
+
+train.df <- encoder(train.df)
+test.df <- encoder(test.df)
+
+```
+
+
+
+## Exploring the Correlation
+
+The correlation between numerical variables are calculated and shown as a correlation matrix. There are significant relationships between energy and acousticness, loudness and acousticness, and energy and loudness.
+
+The correlation between the label(categorical variable) and other categorical variables are determined with chi square analysis. The p value is less than 0.05 so they have a statically significant relationship
+
+
+```{r}
+#combining train and test dataframe's numerical variables for numerical correlation tests.
+cor.df <- bind_rows(train.df, test.df) 
+
+# creating correlation plot
+corrplot(cor(cor.df[,numerical_var]),
+         tl.col ="#AFCBD5",
+         cex.main = 5) 
+title(main = "Correlation of Numerical Variables", line = 2)
+# running chi square test
+chisq.test(table(cor.df$music_genre, cor.df$key))
+chisq.test(table(cor.df$music_genre, cor.df$mode))
+
+
+```
+## PCA Plot
+
+The PCA plot shows the clustering of the label classes. The plot and principal components show low variation between the classes, which makes this classification problem challenging. Luckily, XGBoost should be able to classify adequately, given the large dataset and the model's ensemble and iterative capabilities.
+```{r}
+# converting music genre into a factor
+cor.df$music_genre <- as.factor(cor.df$music_genre)
+
+#running PCA
+pca_result <- prcomp(cor.df[,-14], scale = TRUE)
+# plotting PCA
+autoplot(pca_result, data = cor.df, color = "music_genre") +
+  labs(title ="PCA Plot of 13 Feature Dataset", color = "Music Genre Classes")+
+  scale_colour_manual(values = c("red", "blue", "green", "purple", "orange", "brown", "pink", "yellow", "cyan", "magenta"),
+                      labels = unencoded_music_genre
+                      )
+
+
+```
+
+
+## Converting Train-Test Split
+
+The train and test data frames need to be converted into a DMatrix for XGBoost to be able to use it.
+
+```{r}
+
+train_feature   <- train.df[,-14]
+train_label  <- train.df[,14]
+train_matrix <- xgb.DMatrix(data = as.matrix(train_feature), label = as.matrix(train_label))
+
+test_feature   <- test.df[,-14]
+test_label  <-  test.df[,14]
+test_matrix <- xgb.DMatrix(data = as.matrix(test_feature), label = as.matrix(test_label))
+
+
+```
+
+
+
+## Training XGBoost with basic hyper parameters
+
+This model will be trained with basic hyper parameters for the model to run and  hyper parameters determined by the default XGBoost train function.
+
+
+```{r}
+def_nclass <- 10 # there are 10 classes within music genre
+def_nround <- 800 #the number of rounds is large because the model can automatically stop if it does not improve 
+def_objective <- "multi:softmax"
+def_eval_metric <- "merror"# the model is evaluated with error, which increases accuracy
+
+
+initial_model <- xgboost(
+                   num_class = def_nclass,
+                   objective = def_objective,
+                   eval_metric = def_eval_metric,
+                   data = train_matrix, 
+                   nrounds = def_nround,
+                   early_stopping_rounds = 20,
+                   print_every_n = 10L
+                   )
+print(initial_model$evaluation_log[initial_model$best_iteration])
+
+
+```
+
+
+## Initial evaluation
+
+The data set will be evaluated with F1 score and confusion matrix. The model suffers quite a lot with over fitting, indicated by the exponential decrease in training error and large increase in testing error. Fortunately, overfitting can be controlled with hyper parameter tuning.
+
+```{r}
+#creating confusion matrix on testing data set
+pred_labels <- predict(initial_model, test_matrix)
+initial_confusion_matrix <- confusionMatrix(factor(pred_labels),factor(test.df$music_genre))
+print(initial_confusion_matrix)
+# F1 score
+F1_Score(y_true = test.df$music_genre, y_pred = pred_labels)
+
+# plotting training error against iterations
+initial_model_plot_train <- ggplot(data = initial_model$evaluation_log, mapping = aes(x=initial_model$evaluation_log$iter, y= initial_model$evaluation_log$train_merror))+
+  geom_line(color = "#F57251")+
+  xlab("Number of Iterations")+
+  ylab("Training Error")+
+  ggtitle("Initial Model Mean Training Error")
+print(initial_model_plot_train)
+
+
+# plotting training error and overall error
+training_error = initial_model$evaluation_log$train_merror[def_nround]
+testing_error  = 1- initial_confusion_matrix$overall["Accuracy"]
+
+initial_model_error <- data.frame(
+  error_type = c( "Train Error", "Test Error"),
+  error  = c(training_error, testing_error)
+)
+
+initial_model_error_test_train <- ggplot(initial_model_error, aes(x = error_type, y = error, fill = error_type)) +
+    geom_bar(stat = "identity") +
+    labs(title = "Mean Training and Testing Errors of Initial Model",
+         x = "Error Type",
+         y = "Error",
+         fill = "Error Type"
+         ) +
+    theme_minimal()
+print(initial_model_error_test_train)
+```
+
+## Model Tuning
+
+The model's optimal parameters for eta, max_depth, subsample,lambda, lambda, and training iterations will be determined with mean error on out of fold data. Here is a useful guide: https://carpentries-incubator.github.io/r-ml-tabular-data/06-Exploration/index.html
+
+Finding Optimal ETA rate
+
+```{r}
+def_nfold  <- 10 # the model will be evaluated with 10 fold validation
+def_early_stopping_rounds <- 20 # the model will automatically stop training if out of fold testing error does not improve after 20 rounds
+
+#defining hyper parameter candidates
+eta_params.df <-tibble(eta = c(0.05, 0.07, 0.1, 0.12, 0.15, 0.17))
+eta_params_list <- lapply(split(eta_params.df, 1:nrow(eta_params.df)), as.list)
+
+# creating table for later
+best_eta_itr <- tibble()
+for(i in seq(length(eta_params_list))) {
+  eta_cv_model <- xgb.cv(params = eta_params_list[[i]], 
+                 data = train_matrix, 
+                 nrounds = def_nround, 
+                 nfold = def_nfold,
+                early_stopping_rounds = def_early_stopping_rounds,
+                 objective = def_objective,
+                 eval_metric = def_eval_metric,
+                 num_class = def_nclass,
+                print_every_n = 10L
+               )
+  #logging best iteration for each eta hyper parameter
+  best_eta_itr <- best_eta_itr %>% 
+  bind_rows(eta_cv_model$evaluation_log[eta_cv_model$best_iteration])
+  #clearing memory
+  gc()
+}
+
+#evaluating eta from table
+best_eta <- bind_cols(eta_params.df, best_eta_itr)
+def_eta <- best_eta$eta[which.min(best_eta$test_merror_mean)] 
+print(paste("Best ETA:", def_eta))
+```
+
+
+Finding Optimal Max Depth
+
+```{r}
+
+depth_params.df <-tibble(max_depth = c(2,3, 4, 5, 6, 7))
+depth_params_list <- lapply(split(depth_params.df, 1:nrow(depth_params.df)), as.list)
+
+best_depth_itr <- tibble()
+for(i in seq(length(depth_params_list))) {
+  depth_cv_model <- xgb.cv(params = depth_params_list[[i]], 
+                 data = train_matrix, 
+                 num_class = def_nclass,
+                 nfold = def_nfold,
+                 nrounds = def_nround, 
+                 objective = def_objective,
+                 eval_metric = def_eval_metric,
+                 eta = def_eta,
+                early_stopping_rounds = def_early_stopping_rounds,
+                print_every_n = 10L
+               )
+  best_depth_itr <- best_depth_itr %>% 
+  bind_rows(depth_cv_model$evaluation_log[depth_cv_model$best_iteration])
+  gc() 
+}
+
+best_depth <- bind_cols(depth_params.df, best_depth_itr)
+def_max_depth <- best_depth$max_depth[which.min(best_depth$test_merror_mean)]
+print(paste("Best Max Depth:", def_max_depth))
+```
+
+
+
+Finding Best Sub sample
+
+```{r}
+subsample_params.df <-tibble(subsample = c(0.3, 0.4, 0.5, 0.6, 0.7))
+subsample_params_list <- lapply(split(subsample_params.df, 1:nrow(subsample_params.df)), as.list)
+
+best_subsample_itr <- tibble()
+for(i in seq(length(subsample_params_list))) {
+  subsample_cv_model <- xgb.cv(params = subsample_params_list[[i]], 
+                 data = train_matrix, 
+                 num_class = def_nclass,
+                 nfold = def_nfold,
+                 nrounds = def_nround, 
+                 objective = def_objective,
+                 eval_metric = def_eval_metric,
+                 eta = def_eta,
+                 max_depth = def_max_depth,
+               early_stopping_rounds = def_early_stopping_rounds,
+                prediction = TRUE,
+                print_every_n = 10L
+               )
+  best_subsample_itr <- best_subsample_itr %>% 
+  bind_rows(subsample_cv_model$evaluation_log[subsample_cv_model$best_iteration])
+  gc()
+}
+
+best_subsample <- bind_cols(subsample_params.df, best_subsample_itr)
+def_subsample <- best_subsample$subsample[which.min(best_subsample$test_merror_mean)]
+print(paste("Best Sub Sample:", def_subsample))
+
+```
+
+Finding Best Lambda
+
+```{r}
+
+lambda_params.df <-tibble(lambda = c(1, 10, 20, 30, 40))
+lambda_params_list <- lapply(split(lambda_params.df, 1:nrow(lambda_params.df)), as.list)
+
+best_lambda_itr <- tibble()
+for(i in seq(length(lambda_params_list))) {
+  lambda_cv_model <- xgb.cv(params = lambda_params_list[[i]], 
+                 data = train_matrix, 
+                 num_class = def_nclass,
+                 nfold = def_nfold,
+                 nrounds = def_nround, 
+                 objective = def_objective,
+                 eval_metric = def_eval_metric,
+                 eta = def_eta,
+                 max_depth = def_max_depth,
+                 subsample = def_subsample,
+                early_stopping_rounds = def_early_stopping_rounds,
+                print_every_n = 10L
+               )
+  best_lambda_itr <- best_lambda_itr %>% 
+  bind_rows(lambda_cv_model$evaluation_log[lambda_cv_model$best_iteration])
+  gc()
+}
+
+best_lambda <- bind_cols(lambda_params.df, best_lambda_itr)
+def_lambda <- best_lambda$lambda[which.min(best_lambda$test_merror_mean)]
+print(paste("Best Lambda:", def_lambda))
+
+```
+
+Finding Best Alpha
+
+```{r}
+
+alpha_params.df <-tibble(alpha = c(1, 10, 20, 30, 40))
+alpha_params_list <- lapply(split(alpha_params.df, 1:nrow(alpha_params.df)), as.list)
+
+best_alpha_itr <- tibble()
+for(i in seq(length(alpha_params_list))) {
+  alpha_cv_model <- xgb.cv(params = alpha_params_list[[i]], 
+                 data = train_matrix, 
+                 num_class = def_nclass,
+                 nfold = def_nfold,
+                 nrounds = def_nround, 
+                 objective = def_objective,
+                 eval_metric = def_eval_metric,
+                 eta = def_eta,
+                 max_depth = def_max_depth,
+                 subsample = def_subsample,
+                 lambda = def_lambda,
+               early_stopping_rounds = def_early_stopping_rounds,
+                print_every_n = 10L
+               )
+  best_alpha_itr <- best_alpha_itr %>% 
+  bind_rows(alpha_cv_model$evaluation_log[alpha_cv_model$best_iteration])
+  gc()
+}
+
+best_alpha <- bind_cols(alpha_params.df,best_alpha_itr)
+def_alpha <- best_alpha$alpha[which.min(best_alpha$test_merror_mean)]
+print(paste("Best Alpha:", def_alpha))
+# saving best iteration count because next model is not trained with CV
+def_nround <- best_alpha$iter[which.min(best_alpha$test_merror_mean)]
+print(paste("Best Number of Rounds:", def_nround))
+```
+
+
+## Final model training
+
+Now that the hyper parameters are known, the basic Boost model can be trained and evaluated once again.
+
+
+```{r}
+print(paste("Number of Rounds:", def_nround))
+print(paste("ETA:", def_eta))
+print(paste("Max Depth:", def_max_depth))
+print(paste("Subsample:", def_subsample))
+print(paste("Lambda:", def_lambda))
+print(paste("Alpha:", def_alpha))
+final_model <- xgboost(
+                 data = train_matrix, 
+                 num_class = def_nclass,
+                 nrounds = def_nround, 
+                 objective = def_objective,
+                 eval_metric = def_eval_metric,
+                 eta = def_eta,
+                 max_depth = def_max_depth,
+                 subsample = def_subsample,
+                 lambda = def_lambda,
+                 alpha = def_alpha,
+                print_every_n = 10L
+                )
+```
+## Final model evaluation
+
+
+The model has accuracy of 0.61, which is not terrible considering a null model would have an accuracy of 0.1. 
+
+However, because of the slight imbalance in label class, an F1 score, which accounts for class imbalances, should also be used to determine the validity of the model. The final model has an F1 score of 0.47, which is slightly below average. 
+
+The model has a large coefficient for popularity, making it the most important feature. 
+
+The model also has the lowest accuracy for hip hop. This is probably because hip hop has the lowest number of observations and is not very distinct in the PCA plot.
+
+```{r}
+#plotting feature importance
+feauture_importance <-xgb.importance(colnames(train_matrix), model = final_model)
+xgb.plot.importance(feauture_importance, rel_to_first = TRUE)
+title("Feature Importance", xlab = "Importance Relative to Top Feature")
+
+#confusion matrix
+pred_labels <- predict(final_model, test_matrix)
+final_confusion_matrix <- confusionMatrix(factor(pred_labels), factor(test.df$music_genre))
+print(final_confusion_matrix)
+
+#plotting class accuracy
+class_accuracy <- data.frame(
+  class = unencoded_music_genre,
+  balanced_accuracy  = final_confusion_matrix$byClass[,"Balanced Accuracy"]
+)
+
+class_accuracy_plot <- ggplot(data = class_accuracy, aes(x=class, y= balanced_accuracy))+
+  geom_bar(stat = "identity", fill= "#eea990") +
+  labs(title = "Label Class Balanced Accuracy",
+         x = "Label Class",
+         y = "Balanced Accuracy"
+         ) 
+print(class_accuracy_plot)
+
+#F1 Score
+F1_Score(y_true = test.df$music_genre, y_pred = pred_labels)
+
+#plotting train mean error
+final_model_plot_train <- ggplot(data = final_model$evaluation_log, mapping = aes(x=iter, y= train_merror))+
+  geom_line(color = "#F57251") +
+    labs(title = "Final Model Train Mean Error",
+         x = "Number of Iterations",
+         y = "Train Mean Error"
+         ) 
+print(final_model_plot_train)
+
+#plotting training mean error and testing mean error
+training_error = final_model$best_iteration$train_merror_mean
+testing_error  = 1- final_confusion_matrix$overall["Accuracy"]
+
+final_model_error <- data.frame(
+  error_type = c( "Train Error", "Test Error"),
+  error  = c(training_error, testing_error)
+)
+
+final_model_error_test_train <- ggplot(final_model_error, aes(x = error_type, y = error, fill = error_type)) +
+    geom_bar(stat = "identity") +
+    labs(title = "Mean Training and Testing Errors of Final Model",
+         x = "Error Type",
+         y = "Error",
+         fill = "Error Type"
+         ) +
+    theme_minimal()
+print(final_model_error_test_train)
+```
+
+## Conclusion
+
+In this dataset, the XGBoost model performed decently, considering the low interclass variance and number of 10 classes. Although XGBoost is a, the XGBoost model has a few assumptions that should be considered when applying to other datasets. It assumes that labels can be encoded into numbers and features have a natural order of rank.
+
+
+Initially, I tried Random Forest, another ensemble method, with cross validation. However, the model did not perform well on testing data, so I tried XGBoost. Because XGBoost has the ability to improve over iteratons, I tried XGBoost. Additionally, the disadvantages of XGBoost including complexity and overfitting could be alleviated with hyper parameter tuning. In the end, XGBoost had a slight increase in accuracy.
+
+```{r, eval = FALSE}
+# train the model with hyperparameter tuning
+rf_model <- train(music_genre ~ ., data = train.df, 
+                  method = "ranger", 
+                  trControl = train_control, 
+                  tuneGrid = tune_grid, )
+```
+
+
+
+## For Fun: Predicting Music Genres from Spotify
+
+The function below uses the final XGBoost model to predict music genre given the features of the song.
+The features for songs on Spotify can be found on https://tunebat.com/Search
+
+The predictions are correct for "Gymnopédie No.1"(Classical),"505"(Rock), and "You Lose!"(Electronic).
+However, it is incorrect for songs with less genre-distinctive sounds such as "Let it Happen" and "A Lovely Night"(Jazz).
+
+```{r}
+predict_genre <- function(song, popularity_of_song, acousticness_of_song, danceability_of_song, duration_ms_of_song, energy_of_song, instrumentalness_of_song, key_of_song, liveness_of_song, loudness_of_song, mode_of_song, speechiness_of_song, tempo_of_song, valence_of_song){
+  #creating dataframe given inputted features
+  song_matrix = data.frame(
+    popularity = c(popularity_of_song),
+    acousticness = c(acousticness_of_song),
+    danceability = c(danceability_of_song),
+    duration_ms = c(duration_ms_of_song),
+    energy = c(energy_of_song),
+    instrumentalness = c(instrumentalness_of_song),
+    key = c(key_of_song),
+    liveness = c(liveness_of_song),
+    loudness = c(loudness_of_song),
+    mode = c(mode_of_song),
+    speechiness = c(speechiness_of_song),
+    tempo = c(tempo_of_song),
+    valence = c(valence_of_song)
+  )
+  #encoding features
+  if (is.numeric(song_matrix$key) == FALSE) {
+    song_matrix$key <- as.numeric(factor(song_matrix$key, levels = c("A", "A#", "B", "B#", "C", "C#","D","D#","E","E#","F","F#","G", "G#")))
+  }
+  if (is.numeric(song_matrix$mode) == FALSE) {
+   song_matrix$mode <- ifelse(song_matrix$mode == "Major", 1, 0)
+  }
+  #converting to DMatrix
+  song_matrix <- xgb.DMatrix(as.matrix(song_matrix))
+  #predicting with final XGBoost model
+  prediction <- predict(final_model, song_matrix)
+  #Outputting unencoded label name
+  label_name <- unencoded_music_genre[prediction+1]
+  prediction <- paste("Music Genre of", song, ":", label_name)
+  return(prediction)
+}
+```
+
+
+```{r}
+#predicting classical song
+predict_genre(
+  song = "Gymnopédie No. 1",
+  popularity_of_song = 0.66,
+  acousticness_of_song = 0.99,
+  danceability_of_song = 0.47,
+  duration_ms_of_song = 206000,
+  energy_of_song = 0.01,
+  instrumentalness_of_song = 0.94,
+  key_of_song = "G",
+  liveness_of_song = 0.09,
+  loudness_of_song = -37,
+  mode_of_song = "Minor",
+  speechiness_of_song = 0.12,
+  tempo_of_song = 73,
+  valence_of_song = 0.36
+)
+```
+
+
+```{r}
+#predicting a jazz song
+predict_genre(
+  song = "A Lovely Night",
+  popularity_of_song = 0.61,
+  acousticness_of_song = 0.30,
+  danceability_of_song = 0.36,
+  duration_ms_of_song = 237000,
+  energy_of_song = 0.48,
+  instrumentalness_of_song = 0,
+  key_of_song = "G",
+  liveness_of_song = 0.12,
+  loudness_of_song = -9,
+  mode_of_song = "Major",
+  speechiness_of_song = 0.05,
+  tempo_of_song = 135,
+  valence_of_song = 0.49
+)
+```
+
+
+```{r}
+#predicting a rock song
+predict_genre(
+  song = "505",
+  popularity_of_song= 0.74,
+  acousticness_of_song = 0,
+  danceability_of_song = 0.52 ,
+  duration_ms_of_song = 254000,
+  energy_of_song = 0.85,
+  instrumentalness_of_song = 0,
+  key_of_song = "C",
+  liveness_of_song = 0.07,
+  loudness_of_song = -6,
+  mode_of_song = "Major",
+  speechiness_of_song = 0.05,
+  tempo_of_song = 140,
+  valence_of_song = 0.23
+)
+```
+
+```{r}
+#predicting an alternative/electronic song
+predict_genre(
+  song = "Let it Happen",
+  popularity_of_song= 0.74,
+  acousticness_of_song = 0,
+  danceability_of_song = 0.60 ,
+  duration_ms_of_song = 468000,
+  energy_of_song = 0.88,
+  instrumentalness_of_song = 0.03,
+  key_of_song = "C#",
+  liveness_of_song = 0.11,
+  loudness_of_song = -6,
+  mode_of_song = "Minor",
+  speechiness_of_song = 0.19,
+  tempo_of_song = 125,
+  valence_of_song = 0.58
+)
+```
+
+```{r}
+#predicting an electronic song
+predict_genre(
+  song = "You Lose!",
+  popularity_of_song= 0.46,
+  acousticness_of_song = 0,
+  danceability_of_song = 0.63 ,
+  duration_ms_of_song = 204000,
+  energy_of_song = 0.91,
+  instrumentalness_of_song = 0.37,
+  key_of_song = "A",
+  liveness_of_song = 0.92,
+  loudness_of_song = -6,
+  mode_of_song = "Minor",
+  speechiness_of_song = 0.04,
+  tempo_of_song = 125,
+  valence_of_song = 0.16
+)
+```
+
+
